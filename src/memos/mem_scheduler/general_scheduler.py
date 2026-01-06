@@ -1,6 +1,7 @@
 import concurrent.futures
 import contextlib
 import json
+import time
 import traceback
 
 from memos.configs.mem_scheduler import GeneralSchedulerConfig
@@ -841,19 +842,38 @@ class GeneralScheduler(BaseScheduler):
                 return
 
             # Get the original memory items
-            memory_items = []
-            for mem_id in mem_ids:
+            unique_mem_ids = list(dict.fromkeys(mem_ids))
+            memory_items: list[TextualMemoryItem] = []
+
+            max_retries = 3
+            retry_sleep_seconds = 0.1
+            for attempt in range(max_retries + 1):
                 try:
-                    memory_item = text_mem.get(mem_id, user_name=user_name)
-                    memory_items.append(memory_item)
+                    raw_nodes = text_mem.graph_store.get_nodes(
+                        unique_mem_ids, user_name=user_name
+                    )
+                    memory_items = [TextualMemoryItem.from_dict(n) for n in raw_nodes]
                 except Exception as e:
                     logger.warning(
-                        f"[_process_memories_with_reader] Failed to get memory {mem_id}: {e}"
+                        f"Failed to batch get memory nodes for mem_ids={unique_mem_ids}: {e}"
                     )
-                    continue
+                    memory_items = []
+
+                if memory_items:
+                    break
+
+                if attempt < max_retries:
+                    time.sleep(retry_sleep_seconds)
 
             if not memory_items:
-                logger.warning("No valid memory items found for processing")
+                logger.warning(
+                    "No valid memory items found for processing after retries. "
+                    f"user_id={user_id}, mem_cube_id={mem_cube_id}, user_name={user_name}, mem_ids={unique_mem_ids}"
+                )
+                with contextlib.suppress(Exception):
+                    text_mem.delete(unique_mem_ids, user_name=user_name)
+                with contextlib.suppress(Exception):
+                    text_mem.memory_manager.remove_and_refresh_memory(user_name=user_name)
                 return
 
             # parse working_binding ids from the *original* memory_items (the raw items created in /add)
@@ -1367,31 +1387,22 @@ class GeneralScheduler(BaseScheduler):
 
         text_mem_base = mem_cube.text_mem
         if not isinstance(text_mem_base, TreeTextMemory):
-            if isinstance(text_mem_base, NaiveTextMemory):
-                logger.debug(
-                    f"NaiveTextMemory used for mem_cube_id={mem_cube_id}, processing session turn with simple search."
-                )
-                # Treat NaiveTextMemory similar to TreeTextMemory but with simpler logic
-                # We will perform retrieval to get "working memory" candidates for activation memory
-                # But we won't have a distinct "current working memory"
-                cur_working_memory = []
-            else:
-                logger.warning(
-                    f"Not implemented! Expected TreeTextMemory but got {type(text_mem_base).__name__} "
-                    f"for mem_cube_id={mem_cube_id}, user_id={user_id}. "
-                    f"text_mem_base value: {text_mem_base}"
-                )
-                return [], []
-        else:
-            cur_working_memory: list[TextualMemoryItem] = text_mem_base.get_working_memory(
-                user_name=mem_cube_id
+            logger.error(
+                f"Not implemented! Expected TreeTextMemory but got {type(text_mem_base).__name__} "
+                f"for mem_cube_id={mem_cube_id}, user_id={user_id}. "
+                f"text_mem_base value: {text_mem_base}",
+                exc_info=True,
             )
-            cur_working_memory = cur_working_memory[:top_k]
+            return
 
         logger.info(
             f"[process_session_turn] Processing {len(queries)} queries for user_id={user_id}, mem_cube_id={mem_cube_id}"
         )
 
+        cur_working_memory: list[TextualMemoryItem] = text_mem_base.get_working_memory(
+            user_name=mem_cube_id
+        )
+        cur_working_memory = cur_working_memory[:top_k]
         text_working_memory: list[str] = [w_m.memory for w_m in cur_working_memory]
         intent_result = self.monitor.detect_intent(
             q_list=queries, text_working_memory=text_working_memory
@@ -1431,28 +1442,15 @@ class GeneralScheduler(BaseScheduler):
             )
 
             search_args = {}
-            if isinstance(text_mem_base, NaiveTextMemory):
-                # NaiveTextMemory doesn't support complex search args usually, but let's see
-                # self.retriever.search calls mem_cube.text_mem.search
-                # NaiveTextMemory.search takes query and top_k
-                # SchedulerRetriever.search handles method dispatch
-                # For NaiveTextMemory, we might need to bypass retriever or extend it
-                # But let's try calling naive memory directly if retriever fails or doesn't support it
-                try:
-                    results = text_mem_base.search(query=item, top_k=k_per_evidence)
-                except Exception as e:
-                    logger.warning(f"NaiveTextMemory search failed: {e}")
-                    results = []
-            else:
-                results: list[TextualMemoryItem] = self.retriever.search(
-                    query=item,
-                    user_id=user_id,
-                    mem_cube_id=mem_cube_id,
-                    mem_cube=mem_cube,
-                    top_k=k_per_evidence,
-                    method=self.search_method,
-                    search_args=search_args,
-                )
+            results: list[TextualMemoryItem] = self.retriever.search(
+                query=item,
+                user_id=user_id,
+                mem_cube_id=mem_cube_id,
+                mem_cube=mem_cube,
+                top_k=k_per_evidence,
+                method=self.search_method,
+                search_args=search_args,
+            )
 
             logger.info(
                 f"[process_session_turn] Search results for missing evidence '{item}': "
