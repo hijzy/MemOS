@@ -849,9 +849,7 @@ class GeneralScheduler(BaseScheduler):
             retry_sleep_seconds = 0.1
             for attempt in range(max_retries + 1):
                 try:
-                    raw_nodes = text_mem.graph_store.get_nodes(
-                        unique_mem_ids, user_name=user_name
-                    )
+                    raw_nodes = text_mem.graph_store.get_nodes(unique_mem_ids, user_name=user_name)
                     memory_items = [TextualMemoryItem.from_dict(n) for n in raw_nodes]
                 except Exception as e:
                     logger.warning(
