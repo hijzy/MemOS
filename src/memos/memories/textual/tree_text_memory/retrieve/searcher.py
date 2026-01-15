@@ -351,7 +351,7 @@ class Searcher:
         search_tool_memory: bool = False,
         tool_mem_top_k: int = 6,
     ):
-        """Run A/B/C retrieval paths in parallel"""
+        """Run A/B/C retrieval paths in parallel and collect raw results"""
         tasks = []
         id_filter = {
             "user_id": info.get("user_id", None),
@@ -418,9 +418,22 @@ class Searcher:
                         mode=mode,
                     )
                 )
-            results = []
+
+            # Collect raw items from all paths
+            raw_items = []
             for t in tasks:
-                results.extend(t.result())
+                raw_items.extend(t.result())
+
+            # Convert raw items to (item, relativity) tuples
+            # Items from retrieval already have relativity scores in metadata
+            results = []
+            for item in raw_items:
+                relativity = (
+                    item.metadata.relativity
+                    if hasattr(item.metadata, "relativity") and item.metadata.relativity is not None
+                    else 0.5  # Default score if not available
+                )
+                results.append((item, relativity))
 
         logger.info(f"[SEARCH] Total raw results: {len(results)}")
         return results
@@ -439,7 +452,7 @@ class Searcher:
         user_name: str | None = None,
         id_filter: dict | None = None,
     ):
-        """Retrieve and rerank from WorkingMemory"""
+        """Retrieve from WorkingMemory (without reranking - deferred to SearchHandler)"""
         if memory_type not in ["All", "WorkingMemory"]:
             logger.info(f"[PATH-A] '{query}'Skipped (memory_type does not match)")
             return []
@@ -454,14 +467,8 @@ class Searcher:
             id_filter=id_filter,
             use_fast_graph=self.use_fast_graph,
         )
-        return self.reranker.rerank(
-            query=query,
-            query_embedding=query_embedding[0],
-            graph_results=items,
-            top_k=top_k,
-            parsed_goal=parsed_goal,
-            search_filter=search_filter,
-        )
+        # Return raw items without reranking - unified reranking happens in SearchHandler
+        return items
 
     # --- Path B
     @timed
@@ -478,7 +485,7 @@ class Searcher:
         id_filter: dict | None = None,
         mode: str = "fast",
     ):
-        """Retrieve and rerank from LongTermMemory and UserMemory"""
+        """Retrieve from LongTermMemory and UserMemory (without reranking - deferred to SearchHandler)"""
         results = []
         tasks = []
 
@@ -530,20 +537,14 @@ class Searcher:
             for task in tasks:
                 results.extend(task.result())
 
-        return self.reranker.rerank(
-            query=query,
-            query_embedding=query_embedding[0],
-            graph_results=results,
-            top_k=top_k,
-            parsed_goal=parsed_goal,
-            search_filter=search_filter,
-        )
+        # Return raw items without reranking - unified reranking happens in SearchHandler
+        return results
 
     @timed
     def _retrieve_from_memcubes(
         self, query, parsed_goal, query_embedding, top_k, cube_name="memos_cube01"
     ):
-        """Retrieve and rerank from LongTermMemory and UserMemory"""
+        """Retrieve from MemCubes (without reranking - deferred to SearchHandler)"""
         results = self.graph_retriever.retrieve_from_cube(
             query_embedding=query_embedding,
             top_k=top_k * 2,
@@ -551,13 +552,8 @@ class Searcher:
             cube_name=cube_name,
             user_name=cube_name,
         )
-        return self.reranker.rerank(
-            query=query,
-            query_embedding=query_embedding[0],
-            graph_results=results,
-            top_k=top_k,
-            parsed_goal=parsed_goal,
-        )
+        # Return raw items without reranking - unified reranking happens in SearchHandler
+        return results
 
     # --- Path C
     @timed
