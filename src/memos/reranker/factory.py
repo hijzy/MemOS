@@ -65,4 +65,15 @@ class RerankerFactory:
                 reranker_strategy=c.get("reranker_strategy"),
             )
 
+        if backend in {"mmr", "mmr_dedup"}:
+            from .mmr import MMRReranker
+
+            return MMRReranker(
+                lambda_param=c.get("lambda", 0.7),
+                alpha=c.get("alpha", 0.3),
+                tag_threshold=c.get("tag_threshold", 0.5),
+                level_weights=c.get("level_weights"),
+                level_field=c.get("level_field", "background"),
+            )
+
         raise ValueError(f"Unknown reranker backend: {cfg.backend}")

@@ -59,6 +59,9 @@ class SearchHandler(BaseHandler):
         original_top_k = search_req.top_k
         if search_req.dedup == "sim":
             search_req.top_k = original_top_k * 5
+        elif search_req.dedup == "mmr":
+            # For MMR, also increase recall pool
+            search_req.top_k = original_top_k * 3
 
         cube_view = self._build_cube_view(search_req)
 
@@ -67,6 +70,22 @@ class SearchHandler(BaseHandler):
             results = self._dedup_text_memories(results, original_top_k)
             self._strip_embeddings(results)
             # Restore original top_k for downstream logic or response metadata
+            search_req.top_k = original_top_k
+
+        # Unified MMR deduplication
+        elif search_req.dedup == "mmr" and self.reranker:
+            self.logger.info(
+                f"[SearchHandler] Using unified deduplication with {type(self.reranker).__name__}"
+            )
+            text_mem_deduped, pref_mem_deduped = self._unified_mmr_dedup(
+                results=results,
+                query=search_req.query,
+                original_top_k=original_top_k,
+                pref_top_k=search_req.pref_top_k,
+            )
+            results["text_mem"] = text_mem_deduped
+            results["pref_mem"] = pref_mem_deduped
+            self._strip_embeddings(results)
             search_req.top_k = original_top_k
 
         self.logger.info(
@@ -205,3 +224,108 @@ class SearchHandler(BaseHandler):
                 for cube_id in cube_ids
             ]
             return CompositeCubeView(cube_views=single_views, logger=self.logger)
+
+    def _unified_mmr_dedup(
+        self,
+        results: dict[str, Any],
+        query: str,
+        original_top_k: int,
+        pref_top_k: int,
+    ) -> tuple[list[dict], list[dict]]:
+        """
+        Unified deduplication for both text and preference memories.
+
+        Uses the configured reranker (e.g., MMR) to deduplicate across
+        both text and preference memories.
+
+        Args:
+            results: Dictionary containing text_mem and pref_mem
+            query: Search query
+            original_top_k: Number of text memories to return
+            pref_top_k: Number of preference memories to return
+
+        Returns:
+            Tuple of (text_mem_buckets, pref_mem_list)
+        """
+        # Extract text memories from buckets
+        text_buckets = results.get("text_mem", [])
+        all_text_memories = []
+        for bucket in text_buckets:
+            all_text_memories.extend(bucket.get("memories", []))
+
+        # Extract preference memories
+        pref_memories = results.get("pref_mem", [])
+
+        self.logger.info(
+            f"[Unified Dedup] Before: {len(all_text_memories)} text mems, "
+            f"{len(pref_memories)} pref mems"
+        )
+
+        # Check if we have any memories to process
+        if not all_text_memories and not pref_memories:
+            return (results.get("text_mem", []), [])
+
+        # Mark memory types for later separation
+        for mem in all_text_memories:
+            mem["_is_preference"] = False
+        for mem in pref_memories:
+            mem["_is_preference"] = True
+
+        # Merge all memories
+        all_memories = all_text_memories + pref_memories
+
+        # Call reranker for unified deduplication
+        # Reranker will use existing relativity scores from metadata (no query_embedding needed)
+        total_top_k = original_top_k + pref_top_k
+        try:
+            deduped_items = self.reranker.rerank(
+                query=query,
+                graph_results=all_memories,
+                top_k=total_top_k,
+            )
+        except Exception as e:
+            self.logger.error(f"[Unified Dedup] Reranker failed: {e}", exc_info=True)
+            return (text_buckets, pref_memories)
+
+        # Separate back to text and preference memories
+        text_results = []
+        pref_results = []
+
+        for item, score in deduped_items:
+            # Update score in metadata
+            if isinstance(item, dict):
+                if "metadata" not in item:
+                    item["metadata"] = {}
+                item["metadata"]["relativity"] = score
+                is_pref = item.pop("_is_preference", False)
+            else:
+                item.metadata.relativity = score
+                is_pref = getattr(item, "_is_preference", False)
+                if hasattr(item, "_is_preference"):
+                    delattr(item, "_is_preference")
+
+            if is_pref:
+                pref_results.append(item)
+            else:
+                text_results.append(item)
+
+        # Limit results
+        text_results = text_results[:original_top_k]
+        pref_results = pref_results[:pref_top_k]
+
+        self.logger.info(
+            f"[Unified Dedup] After: {len(text_results)} text mems, {len(pref_results)} pref mems"
+        )
+
+        # Reconstruct text_mem bucket structure
+        new_text_mem = []
+        if text_results:
+            # Simplified: put all in one bucket
+            new_text_mem = [
+                {
+                    "type": "mixed",
+                    "memories": text_results,
+                }
+            ]
+
+        return (new_text_mem, pref_results)

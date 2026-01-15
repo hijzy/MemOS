@@ -375,7 +375,7 @@ class APIConfig:
     @staticmethod
     def get_reranker_config() -> dict[str, Any]:
         """Get embedder configuration."""
-        embedder_backend = os.getenv("MOS_RERANKER_BACKEND", "http_bge")
+        embedder_backend = os.getenv("MOS_RERANKER_BACKEND", "mmr")
 
         if embedder_backend in ["http_bge", "http_bge_strategy"]:
             return {
@@ -387,6 +387,17 @@ class APIConfig:
                     "headers_extra": json.loads(os.getenv("MOS_RERANKER_HEADERS_EXTRA", "{}")),
                     "rerank_source": os.getenv("MOS_RERANK_SOURCE"),
                     "reranker_strategy": os.getenv("MOS_RERANKER_STRATEGY", "single_turn"),
+                },
+            }
+        elif embedder_backend in ["mmr", "mmr_dedup"]:
+            return {
+                "backend": "mmr",
+                "config": {
+                    "lambda": float(os.getenv("MOS_RERANKER_LAMBDA", "0.7")),
+                    "alpha": float(os.getenv("MOS_RERANKER_ALPHA", "0.3")),
+                    "tag_threshold": float(os.getenv("MOS_RERANKER_TAG_THRESHOLD", "0.5")),
+                    "level_weights": {"topic": 1.0, "concept": 1.0, "fact": 1.0},
+                    "level_field": "background",
                 },
             }
         else:

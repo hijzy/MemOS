@@ -319,12 +319,12 @@ class APISearchRequest(BaseRequest):
         description="Number of textual memories to retrieve (top-K). Default: 10.",
     )
 
-    dedup: Literal["no", "sim"] | None = Field(
-        None,
+    dedup: Literal["no", "sim", "mmr"] | None = Field(
+        "mmr",
         description=(
-            "Optional dedup option for textual memories. "
-            "Use 'no' for no dedup, 'sim' for similarity dedup. "
-            "If None, default exact-text dedup is applied."
+            "Dedup option for textual and preference memories. "
+            "Use 'no' for no dedup, 'sim' for similarity dedup, 'mmr' for MMR dedup. "
+            "Default: 'mmr' (uses configured reranker for unified deduplication)."
         ),
     )
 
