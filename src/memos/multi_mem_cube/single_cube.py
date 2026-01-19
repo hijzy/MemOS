@@ -329,12 +329,15 @@ class SingleCubeView(MemCubeView):
         )
 
         # Post retrieve
+        # For MMR/SIM dedup, API layer handles deduplication, so disable it at search layer
+        searcher_dedup = "no" if search_req.dedup == "mmr" else search_req.dedup
+
         raw_memories = self.searcher.post_retrieve(
             retrieved_results=raw_retrieved_memories,
             top_k=search_req.top_k,
             user_name=user_context.mem_cube_id,
             info=info,
-            dedup=search_req.dedup,
+            dedup=searcher_dedup,
         )
 
         # Enhance with query
@@ -458,6 +461,10 @@ class SingleCubeView(MemCubeView):
         search_filter = search_req.filter or None
         plugin = bool(search_req.source is not None and search_req.source == "plugin")
 
+        # For MMR/SIM dedup, API layer handles deduplication, so disable it at search layer
+        # to avoid duplicate deduplication
+        searcher_dedup = "no" if search_req.dedup == "mmr" else search_req.dedup
+
         search_results = self.naive_mem_cube.text_mem.search(
             query=search_req.query,
             user_name=user_context.mem_cube_id,
@@ -475,7 +482,7 @@ class SingleCubeView(MemCubeView):
             plugin=plugin,
             search_tool_memory=search_req.search_tool_memory,
             tool_mem_top_k=search_req.tool_mem_top_k,
-            dedup=search_req.dedup,
+            dedup=searcher_dedup,
         )
 
         formatted_memories = [

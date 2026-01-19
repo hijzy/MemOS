@@ -109,6 +109,10 @@ class Searcher:
             search_tool_memory,
             tool_mem_top_k,
         )
+        # Store query_embedding for later use in post_retrieve
+        # Attach it as metadata to results to pass it downstream
+        for item, score in results:
+            item._query_embedding = query_embedding
         return results
 
     def post_retrieve(
@@ -121,9 +125,15 @@ class Searcher:
         tool_mem_top_k: int = 6,
         dedup: str | None = None,
         plugin=False,
+        query: str | None = None,
     ):
+        logger.info(f"[POST_RETRIEVE] dedup mode: {dedup}, query: {query[:50] if query else None}")
         if dedup == "no":
             deduped = retrieved_results
+        elif dedup == "mmr":
+            # MMR deduplication using reranker
+            logger.info("[POST_RETRIEVE] Using MMR deduplication")
+            deduped = self._mmr_deduplicate_results(retrieved_results, query, top_k)
         else:
             deduped = self._deduplicate_results(retrieved_results)
         final_results = self._sort_and_trim(
@@ -208,6 +218,7 @@ class Searcher:
             search_tool_memory=search_tool_memory,
             tool_mem_top_k=tool_mem_top_k,
             dedup=dedup,
+            query=query,
         )
 
         logger.info(f"[SEARCH] Done. Total {len(final_results)} results.")
@@ -739,6 +750,107 @@ class Searcher:
             if item.memory not in deduped or score > deduped[item.memory][1]:
                 deduped[item.memory] = (item, score)
         return list(deduped.values())
+
+    @timed
+    def _mmr_deduplicate_results(
+        self, results: list[tuple[TextualMemoryItem, float]], query: str | None, top_k: int
+    ) -> list[tuple[TextualMemoryItem, float]]:
+        """
+        Deduplicate results using MMR (Maximal Marginal Relevance) via reranker.
+
+        Args:
+            results: List of (item, score) tuples from retrieval
+            query: Search query for reranking
+            top_k: Number of results to return
+
+        Returns:
+            List of deduplicated (item, score) tuples
+        """
+        if not results:
+            return []
+
+        if not query:
+            logger.warning("[MMR Dedup] No query provided, falling back to simple dedup")
+            return self._deduplicate_results(results)
+
+        if not self.reranker:
+            logger.warning("[MMR Dedup] No reranker available, falling back to simple dedup")
+            return self._deduplicate_results(results)
+
+        logger.info(f"[MMR Dedup] Starting with {len(results)} results")
+
+        # Try to extract query_embedding from results (cached from retrieve stage)
+        query_embedding = None
+        if results and hasattr(results[0][0], "_query_embedding"):
+            cached_embedding = results[0][0]._query_embedding
+            if cached_embedding is not None:
+                # Handle both single embedding and list of embeddings
+                if isinstance(cached_embedding, list):
+                    if len(cached_embedding) > 0 and isinstance(cached_embedding[0], list):
+                        # List of embeddings, take the first one
+                        query_embedding = cached_embedding[0]
+                        logger.debug(f"[MMR Dedup] Reusing query embedding from retrieve stage (extracted first from list)")
+                    else:
+                        # Single embedding
+                        query_embedding = cached_embedding
+                        logger.debug(f"[MMR Dedup] Reusing query embedding from retrieve stage")
+
+        # If not available, compute it
+        if query_embedding is None:
+            try:
+                query_embedding = self.embedder.embed([query])[0]
+                logger.debug(f"[MMR Dedup] Computed query embedding, dimension: {len(query_embedding)}")
+            except Exception as e:
+                logger.warning(f"[MMR Dedup] Failed to compute query embedding: {e}, using existing relativity scores")
+                query_embedding = None
+
+        # Convert results to format expected by reranker
+        # First update each item's metadata with its score
+        items_for_rerank = []
+        for item, score in results:
+            # Create a copy to avoid mutating the original
+            item_copy = TextualMemoryItem(
+                id=item.id,
+                memory=item.memory,
+                metadata=item.metadata.model_copy(deep=True),
+            )
+            # Update relativity score in metadata
+            item_copy.metadata.relativity = score
+
+            # Check if embedding is missing and fetch from database if needed
+            if not item_copy.metadata.embedding or len(item_copy.metadata.embedding) == 0:
+                # Fetch embedding from database
+                try:
+                    node = self.graph_store.get_node(item_copy.id)
+                    if node and node.get("metadata", {}).get("embedding"):
+                        item_copy.metadata.embedding = node["metadata"]["embedding"]
+                        logger.debug(f"[MMR Dedup] Fetched embedding for item {item_copy.id}")
+                except Exception as e:
+                    logger.warning(f"[MMR Dedup] Failed to fetch embedding for item {item_copy.id}: {e}")
+
+            items_for_rerank.append(item_copy)
+
+        try:
+            # Call reranker with MMR deduplication
+            # Pass query_embedding to enable accurate relevance scoring
+            reranked_results = self.reranker.rerank(
+                query=query,
+                graph_results=items_for_rerank,
+                top_k=top_k,
+                query_embedding=query_embedding,
+            )
+
+            # Convert back to (item, score) tuples
+            deduped = [(item, score) for item, score in reranked_results]
+
+            logger.info(f"[MMR Dedup] After MMR: {len(deduped)} results")
+            return deduped
+
+        except Exception as e:
+            logger.error(f"[MMR Dedup] Reranker failed: {e}", exc_info=True)
+            logger.warning("[MMR Dedup] Falling back to simple deduplication")
+            return self._deduplicate_results(results)
+
 
     @timed
     def _sort_and_trim(

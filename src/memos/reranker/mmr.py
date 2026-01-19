@@ -211,7 +211,7 @@ class MMRReranker(BaseReranker):
             if isinstance(item, dict):
                 score = item.get("metadata", {}).get("relativity")
             elif hasattr(item, "metadata"):
-                score = getattr(item.metadata, "relativity", None)
+                score = getattr(item.metadata, "relativity", None) or item.metadata.get("model_extra").get("relativity")
 
             if score is None:
                 # If any item lacks a relativity score, we can't use this optimization
