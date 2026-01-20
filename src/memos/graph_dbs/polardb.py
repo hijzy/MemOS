@@ -1033,7 +1033,7 @@ class PolarDBGraphDB(BaseGraphDB):
         Returns:
             dict: Node properties as key-value pairs, or None if not found.
         """
-
+        include_embedding = True  # jiang, 临时配置
         select_fields = "id, properties, embedding" if include_embedding else "id, properties"
 
         query = f"""
