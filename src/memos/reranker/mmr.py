@@ -144,7 +144,6 @@ class MMRReranker(BaseReranker):
                 mmr_score = (
                     self.lambda_param * rel_scores[idx]
                     - (1 - self.lambda_param) * redundancy
-                    # - self.alpha * tag_penalty  # 禁用 tag_penalty
                 )
 
                 if mmr_score > best_score:
