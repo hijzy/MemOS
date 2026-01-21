@@ -36,7 +36,7 @@ class MMRReranker(BaseReranker):
 
     def __init__(
         self,
-        lambda_param: float = 0.7,
+        lambda_param: float = 0.75,
         alpha: float = 0.3,
         tag_threshold: float = 0.5,
         level_weights: dict[str, float] | None = None,
@@ -144,7 +144,7 @@ class MMRReranker(BaseReranker):
                 mmr_score = (
                     self.lambda_param * rel_scores[idx]
                     - (1 - self.lambda_param) * redundancy
-                    - self.alpha * tag_penalty
+                    # - self.alpha * tag_penalty  # 禁用 tag_penalty
                 )
 
                 if mmr_score > best_score:
