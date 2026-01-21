@@ -757,11 +757,19 @@ class Searcher:
         self, results: list[tuple[TextualMemoryItem, float]], query: str | None, top_k: int
     ) -> list[tuple[TextualMemoryItem, float]]:
         """
-        Deduplicate results using MMR (Maximal Marginal Relevance) via reranker.
+        Deduplicate results using MMR (Maximal Marginal Relevance).
+
+        Strategy:
+        1. Use http_bge reranker to get accurate relevance_score for each item
+        2. Use existing embeddings from database to calculate redundancy for MMR
+
+        This combines the best of both:
+        - Accurate relevance scores from reranker service
+        - Embedding-based redundancy calculation for diversity
 
         Args:
             results: List of (item, score) tuples from retrieval
-            query: Search query for reranking
+            query: Search query for MMR
             top_k: Number of results to return
 
         Returns:
@@ -780,33 +788,7 @@ class Searcher:
 
         logger.info(f"[MMR Dedup] Starting with {len(results)} results")
 
-        # Try to extract query_embedding from results (cached from retrieve stage)
-        query_embedding = None
-        if results and hasattr(results[0][0], "_query_embedding"):
-            cached_embedding = results[0][0]._query_embedding
-            if cached_embedding is not None:
-                # Handle both single embedding and list of embeddings
-                if isinstance(cached_embedding, list):
-                    if len(cached_embedding) > 0 and isinstance(cached_embedding[0], list):
-                        # List of embeddings, take the first one
-                        query_embedding = cached_embedding[0]
-                        logger.debug(f"[MMR Dedup] Reusing query embedding from retrieve stage (extracted first from list)")
-                    else:
-                        # Single embedding
-                        query_embedding = cached_embedding
-                        logger.debug(f"[MMR Dedup] Reusing query embedding from retrieve stage")
-
-        # If not available, compute it
-        if query_embedding is None:
-            try:
-                query_embedding = self.embedder.embed([query])[0]
-                logger.debug(f"[MMR Dedup] Computed query embedding, dimension: {len(query_embedding)}")
-            except Exception as e:
-                logger.warning(f"[MMR Dedup] Failed to compute query embedding: {e}, using existing relativity scores")
-                query_embedding = None
-
-        # Convert results to format expected by reranker
-        # First update each item's metadata with its score
+        # Step 1: Call reranker to get accurate relevance scores
         items_for_rerank = []
         for item, score in results:
             # Create a copy to avoid mutating the original
@@ -815,40 +797,67 @@ class Searcher:
                 memory=item.memory,
                 metadata=item.metadata.model_copy(deep=True),
             )
-            # Update relativity score in metadata
+            # Keep original score for now
             item_copy.metadata.relativity = score
-
-            # Check if embedding is missing and fetch from database if needed
-            if not item_copy.metadata.embedding or len(item_copy.metadata.embedding) == 0:
-                # Fetch embedding from database
-                try:
-                    node = self.graph_store.get_node(item_copy.id)
-                    if node and node.get("metadata", {}).get("embedding"):
-                        item_copy.metadata.embedding = node["metadata"]["embedding"]
-                        logger.debug(f"[MMR Dedup] Fetched embedding for item {item_copy.id}")
-                except Exception as e:
-                    logger.warning(f"[MMR Dedup] Failed to fetch embedding for item {item_copy.id}: {e}")
-
             items_for_rerank.append(item_copy)
 
         try:
-            # Call reranker with MMR deduplication
-            # Pass query_embedding to enable accurate relevance scoring
-            reranked_results = self.reranker.rerank(
+            # Use http_bge reranker to get accurate relevance scores
+            # Note: We pass a large top_k to get scores for all items
+            reranked_with_scores = self.reranker.rerank(
                 query=query,
                 graph_results=items_for_rerank,
-                top_k=top_k,
-                query_embedding=query_embedding,
+                top_k=len(items_for_rerank),  # Get scores for all items
             )
 
-            # Convert back to (item, score) tuples
-            deduped = [(item, score) for item, score in reranked_results]
+            logger.info(f"[MMR Dedup] Got {len(reranked_with_scores)} relevance scores from reranker")
 
-            logger.info(f"[MMR Dedup] After MMR: {len(deduped)} results")
-            return deduped
+            # Update items with accurate relevance scores from reranker
+            for item, reranker_score in reranked_with_scores:
+                item.metadata.relativity = reranker_score
+
+            items_with_relevance = [item for item, score in reranked_with_scores]
 
         except Exception as e:
-            logger.error(f"[MMR Dedup] Reranker failed: {e}", exc_info=True)
+            logger.error(f"[MMR Dedup] Reranker failed to get relevance scores: {e}", exc_info=True)
+            logger.warning("[MMR Dedup] Falling back to simple deduplication")
+            return self._deduplicate_results(results)
+
+        # Step 2: Fetch embeddings from database if missing
+        for item in items_with_relevance:
+            if not item.metadata.embedding or len(item.metadata.embedding) == 0:
+                try:
+                    node = self.graph_store.get_node(item.id)
+                    if node and node.get("metadata", {}).get("embedding"):
+                        item.metadata.embedding = node["metadata"]["embedding"]
+                        logger.debug(f"[MMR Dedup] Fetched embedding for item {item.id}")
+                except Exception as e:
+                    logger.warning(f"[MMR Dedup] Failed to fetch embedding for item {item.id}: {e}")
+
+        # Step 3: Use MMR with reranker relevance scores and database embeddings
+        try:
+            from memos.reranker.mmr import MMRReranker
+
+            # Create MMRReranker with configured parameters
+            mmr_reranker = MMRReranker(
+                lambda_param=0.75,  # Balance between relevance and diversity
+                alpha=0.15,          # Tag penalty weight
+            )
+
+            # Call MMR reranker
+            # Note: We don't pass query_embedding, so MMR will use existing relativity scores
+            # from metadata (which we just updated with accurate reranker scores)
+            reranked_results = mmr_reranker.rerank(
+                query=query,
+                graph_results=items_with_relevance,
+                top_k=top_k,
+            )
+
+            logger.info(f"[MMR Dedup] After MMR: {len(reranked_results)} results")
+            return reranked_results
+
+        except Exception as e:
+            logger.error(f"[MMR Dedup] MMR reranking failed: {e}", exc_info=True)
             logger.warning("[MMR Dedup] Falling back to simple deduplication")
             return self._deduplicate_results(results)
 
