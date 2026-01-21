@@ -36,7 +36,7 @@ class MMRReranker(BaseReranker):
 
     def __init__(
         self,
-        lambda_param: float = 0.75,
+        lambda_param: float = 0.8,
         alpha: float = 0.15,
         tag_threshold: float = 0.5,
         level_weights: dict[str, float] | None = None,
