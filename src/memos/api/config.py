@@ -375,7 +375,7 @@ class APIConfig:
     @staticmethod
     def get_reranker_config() -> dict[str, Any]:
         """Get embedder configuration."""
-        embedder_backend = os.getenv("MOS_RERANKER_BACKEND", "mmr")
+        embedder_backend = os.getenv("MOS_RERANKER_BACKEND", "http_bge")
 
         if embedder_backend in ["http_bge", "http_bge_strategy"]:
             return {

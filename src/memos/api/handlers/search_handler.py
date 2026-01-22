@@ -235,8 +235,13 @@ class SearchHandler(BaseHandler):
         """
         Unified deduplication for both text and preference memories.
 
-        Uses the configured reranker (e.g., MMR) to deduplicate across
-        both text and preference memories.
+        Strategy (same as Searcher):
+        1. Use http_bge reranker to get accurate relevance_score for each item
+        2. Use MMRReranker for deduplication with http_bge scores + embeddings
+
+        This combines:
+        - Accurate relevance scores from reranker service
+        - Embedding-based redundancy calculation for diversity
 
         Args:
             results: Dictionary containing text_mem and pref_mem
@@ -274,18 +279,91 @@ class SearchHandler(BaseHandler):
         # Merge all memories
         all_memories = all_text_memories + pref_memories
 
-        # Call reranker for unified deduplication
-        # Reranker will use existing relativity scores from metadata (no query_embedding needed)
         total_top_k = original_top_k + pref_top_k
+
+        # Step 1: Use http_bge reranker to get accurate relevance scores
         try:
-            deduped_items = self.reranker.rerank(
+            self.logger.info(f"[Unified Dedup] Step 1: Getting relevance scores from http_bge reranker")
+            reranked_with_scores = self.reranker.rerank(
                 query=query,
                 graph_results=all_memories,
+                top_k=len(all_memories),  # Get scores for all items
+            )
+
+            self.logger.info(f"[Unified Dedup] Got {len(reranked_with_scores)} relevance scores from reranker")
+
+            # Update items with accurate relevance scores from reranker
+            items_with_relevance = []
+            for item, reranker_score in reranked_with_scores:
+                # Update score in metadata
+                if isinstance(item, dict):
+                    if "metadata" not in item:
+                        item["metadata"] = {}
+                    item["metadata"]["relativity"] = reranker_score
+                else:
+                    if not hasattr(item, "metadata"):
+                        from types import SimpleNamespace
+                        item.metadata = SimpleNamespace()
+                    item.metadata.relativity = reranker_score
+                items_with_relevance.append(item)
+
+        except Exception as e:
+            self.logger.error(f"[Unified Dedup] Reranker failed to get relevance scores: {e}", exc_info=True)
+            return (text_buckets, pref_memories)
+
+        # Step 2: Fetch embeddings if missing (for MMR redundancy calculation)
+        for item in items_with_relevance:
+            if isinstance(item, dict):
+                embedding = item.get("metadata", {}).get("embedding")
+                if not embedding or len(embedding) == 0:
+                    # Try to compute embedding using embedder if available
+                    if self.searcher and self.searcher.embedder:
+                        try:
+                            memory_text = item.get("memory", "")
+                            if memory_text:
+                                item["metadata"]["embedding"] = self.searcher.embedder.embed([memory_text])[0]
+                                self.logger.debug(f"[Unified Dedup] Computed embedding for item")
+                        except Exception as e:
+                            self.logger.warning(f"[Unified Dedup] Failed to compute embedding: {e}")
+            else:
+                # Handle object-style items
+                if not hasattr(item.metadata, "embedding") or not item.metadata.embedding or len(item.metadata.embedding) == 0:
+                    if self.searcher and self.searcher.embedder:
+                        try:
+                            memory_text = getattr(item, "memory", "")
+                            if memory_text:
+                                item.metadata.embedding = self.searcher.embedder.embed([memory_text])[0]
+                                self.logger.debug(f"[Unified Dedup] Computed embedding for item")
+                        except Exception as e:
+                            self.logger.warning(f"[Unified Dedup] Failed to compute embedding: {e}")
+
+        # Step 3: Use MMR with reranker relevance scores and embeddings
+        try:
+            from memos.reranker.mmr import MMRReranker
+
+            self.logger.info("[Unified Dedup] Step 2: Using MMR for deduplication")
+
+            # Create MMRReranker with configured parameters
+            mmr_reranker = MMRReranker(
+                lambda_param=0.8,   # Balance between relevance and diversity
+                alpha=0.15,         # Tag penalty weight
+            )
+
+            # Call MMR reranker
+            # Note: We don't pass query_embedding, so MMR will use existing relativity scores
+            # from metadata (which we just updated with accurate reranker scores)
+            deduped_items = mmr_reranker.rerank(
+                query=query,
+                graph_results=items_with_relevance,
                 top_k=total_top_k,
             )
+
+            self.logger.info(f"[Unified Dedup] After MMR: {len(deduped_items)} results")
+
         except Exception as e:
-            self.logger.error(f"[Unified Dedup] Reranker failed: {e}", exc_info=True)
-            return (text_buckets, pref_memories)
+            self.logger.error(f"[Unified Dedup] MMR deduplication failed: {e}", exc_info=True)
+            # Fallback: use items with relevance scores but without MMR
+            deduped_items = [(item, item.get("metadata", {}).get("relativity", 0.5) if isinstance(item, dict) else getattr(item.metadata, "relativity", 0.5)) for item in items_with_relevance[:total_top_k]]
 
         # Separate back to text and preference memories
         text_results = []
@@ -299,6 +377,9 @@ class SearchHandler(BaseHandler):
                 item["metadata"]["relativity"] = score
                 is_pref = item.pop("_is_preference", False)
             else:
+                if not hasattr(item, "metadata"):
+                    from types import SimpleNamespace
+                    item.metadata = SimpleNamespace()
                 item.metadata.relativity = score
                 is_pref = getattr(item, "_is_preference", False)
                 if hasattr(item, "_is_preference"):
