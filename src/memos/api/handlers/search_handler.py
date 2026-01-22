@@ -236,13 +236,13 @@ class SearchHandler(BaseHandler):
         """
         Unified deduplication for both text and preference memories.
 
-        Strategy (same as Searcher):
-        1. Use http_bge reranker to get accurate relevance_score for each item
-        2. Use MMRReranker for deduplication with http_bge scores + embeddings
+        Strategy (粗排+精排两阶段):
+        1. 粗排：使用embedding MMR取top_k*3（快速本地计算）
+        2. 精排：使用http_bge reranker精确排序取top_k（准确但慢）
 
         This combines:
-        - Accurate relevance scores from reranker service
-        - Embedding-based redundancy calculation for diversity
+        - Fast embedding-based MMR for initial filtering
+        - Accurate http_bge reranker for final ranking
 
         Args:
             results: Dictionary containing text_mem and pref_mem
@@ -281,98 +281,101 @@ class SearchHandler(BaseHandler):
         all_memories = all_text_memories + pref_memories
 
         total_top_k = original_top_k + pref_top_k
+        coarse_top_k = total_top_k * 3  # 粗排取3倍，写死参数
 
-        # Step 1: Use http_bge reranker to get accurate relevance scores
-        try:
-            self.logger.info(f"[Unified Dedup] Step 1: Getting relevance scores from http_bge reranker")
-            reranked_with_scores = self.reranker.rerank(
-                query=query,
-                graph_results=all_memories,
-                top_k=len(all_memories),  # Get scores for all items
-            )
+        self.logger.info(f"[Unified Dedup] Stage 1: Coarse ranking with embedding MMR (top_k={coarse_top_k})")
 
-            self.logger.info(f"[Unified Dedup] Got {len(reranked_with_scores)} relevance scores from reranker")
+        # ===== Stage 1: 粗排 - 使用embedding MMR =====
+        # Step 1.1: 准备items并获取数据库embedding
+        items_for_coarse = []
+        for mem in all_memories:
+            if isinstance(mem, dict):
+                # 获取已有的relativity score
+                relativity = mem.get("metadata", {}).get("relativity", 0.5)
 
-            # Update items with accurate relevance scores from reranker
-            items_with_relevance = []
-            for item, reranker_score in reranked_with_scores:
-                # Update score in metadata
-                if isinstance(item, dict):
-                    if "metadata" not in item:
-                        item["metadata"] = {}
-                    item["metadata"]["relativity"] = reranker_score
-                else:
-                    if not hasattr(item, "metadata"):
-                        from types import SimpleNamespace
-                        item.metadata = SimpleNamespace()
-                    item.metadata.relativity = reranker_score
-                items_with_relevance.append(item)
-
-        except Exception as e:
-            self.logger.error(f"[Unified Dedup] Reranker failed to get relevance scores: {e}", exc_info=True)
-            return (text_buckets, pref_memories)
-
-        # Step 2: Fetch embeddings from database if missing (for MMR redundancy calculation)
-        for item in items_with_relevance:
-            if isinstance(item, dict):
-                embedding = item.get("metadata", {}).get("embedding")
+                # 从数据库获取embedding
+                embedding = mem.get("metadata", {}).get("embedding")
                 if not embedding or len(embedding) == 0:
-                    # Fetch embedding from database
                     try:
-                        item_id = item.get("id")
-                        if item_id and self.graph_db:
-                            node = self.graph_db.get_node(item_id)
+                        mem_id = mem.get("id")
+                        if mem_id and self.graph_db:
+                            node = self.graph_db.get_node(mem_id)
                             if node and node.get("metadata", {}).get("embedding"):
-                                item["metadata"]["embedding"] = node["metadata"]["embedding"]
-                                self.logger.debug(f"[Unified Dedup] Fetched embedding from database for item {item_id}")
+                                embedding = node["metadata"]["embedding"]
+                                mem["metadata"]["embedding"] = embedding
+                                self.logger.debug(f"[Unified Dedup] Fetched embedding from DB for {mem_id}")
                     except Exception as e:
-                        self.logger.warning(f"[Unified Dedup] Failed to fetch embedding from database: {e}")
+                        self.logger.warning(f"[Unified Dedup] Failed to fetch embedding: {e}")
+
+                items_for_coarse.append(mem)
             else:
                 # Handle object-style items
-                if not hasattr(item.metadata, "embedding") or not item.metadata.embedding or len(item.metadata.embedding) == 0:
-                    try:
-                        item_id = getattr(item, "id", None)
-                        if item_id and self.graph_db:
-                            node = self.graph_db.get_node(item_id)
-                            if node and node.get("metadata", {}).get("embedding"):
-                                item.metadata.embedding = node["metadata"]["embedding"]
-                                self.logger.debug(f"[Unified Dedup] Fetched embedding from database for item {item_id}")
-                    except Exception as e:
-                        self.logger.warning(f"[Unified Dedup] Failed to fetch embedding from database: {e}")
+                relativity = getattr(mem.metadata, "relativity", 0.5) if hasattr(mem, "metadata") else 0.5
 
-        # Step 3: Use MMR with reranker relevance scores and embeddings
+                if hasattr(mem, "metadata"):
+                    if not hasattr(mem.metadata, "embedding") or not mem.metadata.embedding or len(mem.metadata.embedding) == 0:
+                        try:
+                            mem_id = getattr(mem, "id", None)
+                            if mem_id and self.graph_db:
+                                node = self.graph_db.get_node(mem_id)
+                                if node and node.get("metadata", {}).get("embedding"):
+                                    mem.metadata.embedding = node["metadata"]["embedding"]
+                                    self.logger.debug(f"[Unified Dedup] Fetched embedding from DB for {mem_id}")
+                        except Exception as e:
+                            self.logger.warning(f"[Unified Dedup] Failed to fetch embedding: {e}")
+
+                items_for_coarse.append(mem)
+
+        # Step 1.2: 使用MMR做粗排
         try:
             from memos.reranker.mmr import MMRReranker
 
-            self.logger.info("[Unified Dedup] Step 2: Using MMR for deduplication")
-
-            # Create MMRReranker with configured parameters
-            mmr_reranker = MMRReranker(
-                lambda_param=0.8,   # Balance between relevance and diversity
-                alpha=0.1,          # Tag penalty weight (same as searcher)
+            # 创建MMRReranker进行粗排
+            mmr_coarse = MMRReranker(
+                lambda_param=0.8,   # 写死参数
+                alpha=0.1,          # 写死参数
             )
 
-            # Call MMR reranker
-            # Note: We don't pass query_embedding, so MMR will use existing relativity scores
-            # from metadata (which we just updated with accurate reranker scores)
-            deduped_items = mmr_reranker.rerank(
+            # 粗排：取top_k*3
+            coarse_results = mmr_coarse.rerank(
                 query=query,
-                graph_results=items_with_relevance,
-                top_k=total_top_k,
+                graph_results=items_for_coarse,
+                top_k=coarse_top_k,
             )
 
-            self.logger.info(f"[Unified Dedup] After MMR: {len(deduped_items)} results")
+            self.logger.info(f"[Unified Dedup] Stage 1 done: {len(coarse_results)} items after coarse ranking")
 
         except Exception as e:
-            self.logger.error(f"[Unified Dedup] MMR deduplication failed: {e}", exc_info=True)
-            # Fallback: use items with relevance scores but without MMR
-            deduped_items = [(item, item.get("metadata", {}).get("relativity", 0.5) if isinstance(item, dict) else getattr(item.metadata, "relativity", 0.5)) for item in items_with_relevance[:total_top_k]]
+            self.logger.error(f"[Unified Dedup] Coarse ranking failed: {e}", exc_info=True)
+            # Fallback: 如果粗排失败，使用原始结果
+            coarse_results = [(mem, mem.get("metadata", {}).get("relativity", 0.5) if isinstance(mem, dict) else getattr(mem.metadata, "relativity", 0.5)) for mem in items_for_coarse[:coarse_top_k]]
+
+        # ===== Stage 2: 精排 - 使用http_bge reranker =====
+        self.logger.info(f"[Unified Dedup] Stage 2: Fine ranking with http_bge reranker (top_k={total_top_k})")
+
+        # 提取粗排后的items
+        coarse_items = [item for item, score in coarse_results]
+
+        try:
+            # 使用http_bge reranker精排
+            fine_results = self.reranker.rerank(
+                query=query,
+                graph_results=coarse_items,
+                top_k=total_top_k,  # 精排取最终的top_k
+            )
+
+            self.logger.info(f"[Unified Dedup] Stage 2 done: {len(fine_results)} items after fine ranking")
+
+        except Exception as e:
+            self.logger.error(f"[Unified Dedup] Fine ranking failed: {e}", exc_info=True)
+            # Fallback: 使用粗排结果
+            fine_results = coarse_results[:total_top_k]
 
         # Separate back to text and preference memories
         text_results = []
         pref_results = []
 
-        for item, score in deduped_items:
+        for item, score in fine_results:
             # Update score in metadata
             if isinstance(item, dict):
                 if "metadata" not in item:
@@ -398,7 +401,7 @@ class SearchHandler(BaseHandler):
         pref_results = pref_results[:pref_top_k]
 
         self.logger.info(
-            f"[Unified Dedup] After: {len(text_results)} text mems, {len(pref_results)} pref mems"
+            f"[Unified Dedup] Final: {len(text_results)} text mems, {len(pref_results)} pref mems"
         )
 
         # Reconstruct text_mem bucket structure
