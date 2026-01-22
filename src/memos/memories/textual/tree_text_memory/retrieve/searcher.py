@@ -128,7 +128,7 @@ class Searcher:
         query: str | None = None,
     ):
         logger.info(f"[POST_RETRIEVE] dedup mode: {dedup}, query: {query[:50] if query else None}")
-        dedup = "mmr"  # jiang, 临时配置
+        # dedup = "mmr"  # jiang, 临时配置
         if dedup == "no":
             deduped = retrieved_results
         elif dedup == "mmr":
