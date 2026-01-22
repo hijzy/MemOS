@@ -312,31 +312,33 @@ class SearchHandler(BaseHandler):
             self.logger.error(f"[Unified Dedup] Reranker failed to get relevance scores: {e}", exc_info=True)
             return (text_buckets, pref_memories)
 
-        # Step 2: Fetch embeddings if missing (for MMR redundancy calculation)
+        # Step 2: Fetch embeddings from database if missing (for MMR redundancy calculation)
         for item in items_with_relevance:
             if isinstance(item, dict):
                 embedding = item.get("metadata", {}).get("embedding")
                 if not embedding or len(embedding) == 0:
-                    # Try to compute embedding using embedder if available
-                    if self.searcher and self.searcher.embedder:
-                        try:
-                            memory_text = item.get("memory", "")
-                            if memory_text:
-                                item["metadata"]["embedding"] = self.searcher.embedder.embed([memory_text])[0]
-                                self.logger.debug(f"[Unified Dedup] Computed embedding for item")
-                        except Exception as e:
-                            self.logger.warning(f"[Unified Dedup] Failed to compute embedding: {e}")
+                    # Fetch embedding from database
+                    try:
+                        item_id = item.get("id")
+                        if item_id and self.graph_db:
+                            node = self.graph_db.get_node(item_id)
+                            if node and node.get("metadata", {}).get("embedding"):
+                                item["metadata"]["embedding"] = node["metadata"]["embedding"]
+                                self.logger.debug(f"[Unified Dedup] Fetched embedding from database for item {item_id}")
+                    except Exception as e:
+                        self.logger.warning(f"[Unified Dedup] Failed to fetch embedding from database: {e}")
             else:
                 # Handle object-style items
                 if not hasattr(item.metadata, "embedding") or not item.metadata.embedding or len(item.metadata.embedding) == 0:
-                    if self.searcher and self.searcher.embedder:
-                        try:
-                            memory_text = getattr(item, "memory", "")
-                            if memory_text:
-                                item.metadata.embedding = self.searcher.embedder.embed([memory_text])[0]
-                                self.logger.debug(f"[Unified Dedup] Computed embedding for item")
-                        except Exception as e:
-                            self.logger.warning(f"[Unified Dedup] Failed to compute embedding: {e}")
+                    try:
+                        item_id = getattr(item, "id", None)
+                        if item_id and self.graph_db:
+                            node = self.graph_db.get_node(item_id)
+                            if node and node.get("metadata", {}).get("embedding"):
+                                item.metadata.embedding = node["metadata"]["embedding"]
+                                self.logger.debug(f"[Unified Dedup] Fetched embedding from database for item {item_id}")
+                    except Exception as e:
+                        self.logger.warning(f"[Unified Dedup] Failed to fetch embedding from database: {e}")
 
         # Step 3: Use MMR with reranker relevance scores and embeddings
         try:
@@ -347,7 +349,7 @@ class SearchHandler(BaseHandler):
             # Create MMRReranker with configured parameters
             mmr_reranker = MMRReranker(
                 lambda_param=0.8,   # Balance between relevance and diversity
-                alpha=0.15,         # Tag penalty weight
+                alpha=0.1,          # Tag penalty weight (same as searcher)
             )
 
             # Call MMR reranker
