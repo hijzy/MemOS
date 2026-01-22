@@ -840,7 +840,7 @@ class Searcher:
 
             # Create MMRReranker with configured parameters
             mmr_reranker = MMRReranker(
-                lambda_param=0.75,  # Balance between relevance and diversity
+                lambda_param=0.9,  # Balance between relevance and diversity
                 alpha=0.15,          # Tag penalty weight
             )
 
