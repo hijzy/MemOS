@@ -56,6 +56,7 @@ class SearchHandler(BaseHandler):
         self.logger.info(f"[SearchHandler] Search Req is: {search_req}")
 
         # Increase recall pool if deduplication is enabled to ensure diversity
+        search_req.dedup = "mmr"
         original_top_k = search_req.top_k
         if search_req.dedup == "sim":
             search_req.top_k = original_top_k * 5
