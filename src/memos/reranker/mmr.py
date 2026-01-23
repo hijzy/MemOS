@@ -53,8 +53,8 @@ class MMRReranker(BaseReranker):
             level_weights: Optional weights for different memory levels
             level_field: Field name for memory level in metadata
         """
-        self.lambda_param = lambda_param
-        self.alpha = alpha
+        self.lambda_param = 1
+        self.alpha = 0
         self.tag_threshold = tag_threshold
         self.level_weights = level_weights or {"topic": 1.0, "concept": 1.0, "fact": 1.0}
         self.level_field = level_field
