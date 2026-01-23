@@ -236,13 +236,9 @@ class SearchHandler(BaseHandler):
         """
         Unified deduplication for both text and preference memories.
 
-        Strategy (粗排+精排两阶段):
-        1. 粗排：使用embedding MMR取top_k*3（快速本地计算）
-        2. 精排：使用http_bge reranker精确排序取top_k（准确但慢）
-
-        This combines:
-        - Fast embedding-based MMR for initial filtering
-        - Accurate http_bge reranker for final ranking
+        使用统一的TwoStageMMRDeduplicator进行去重：
+        1. 粗排：embedding MMR（快速）
+        2. 精排：配置的reranker（准确）
 
         Args:
             results: Dictionary containing text_mem and pref_mem
@@ -279,103 +275,51 @@ class SearchHandler(BaseHandler):
 
         # Merge all memories
         all_memories = all_text_memories + pref_memories
-
         total_top_k = original_top_k + pref_top_k
-        coarse_top_k = total_top_k * 3  # 粗排取3倍，写死参数
 
-        self.logger.info(f"[Unified Dedup] Stage 1: Coarse ranking with embedding MMR (top_k={coarse_top_k})")
-
-        # ===== Stage 1: 粗排 - 使用embedding MMR =====
-        # Step 1.1: 准备items并获取数据库embedding
-        items_for_coarse = []
-        for mem in all_memories:
-            if isinstance(mem, dict):
-                # 获取已有的relativity score
-                relativity = mem.get("metadata", {}).get("relativity", 0.5)
-
-                # 从数据库获取embedding
-                embedding = mem.get("metadata", {}).get("embedding")
-                if not embedding or len(embedding) == 0:
-                    try:
-                        mem_id = mem.get("id")
-                        if mem_id and self.graph_db:
-                            node = self.graph_db.get_node(mem_id)
-                            if node and node.get("metadata", {}).get("embedding"):
-                                embedding = node["metadata"]["embedding"]
-                                mem["metadata"]["embedding"] = embedding
-                                self.logger.debug(f"[Unified Dedup] Fetched embedding from DB for {mem_id}")
-                    except Exception as e:
-                        self.logger.warning(f"[Unified Dedup] Failed to fetch embedding: {e}")
-
-                items_for_coarse.append(mem)
-            else:
-                # Handle object-style items
-                relativity = getattr(mem.metadata, "relativity", 0.5) if hasattr(mem, "metadata") else 0.5
-
-                if hasattr(mem, "metadata"):
-                    if not hasattr(mem.metadata, "embedding") or not mem.metadata.embedding or len(mem.metadata.embedding) == 0:
-                        try:
-                            mem_id = getattr(mem, "id", None)
-                            if mem_id and self.graph_db:
-                                node = self.graph_db.get_node(mem_id)
-                                if node and node.get("metadata", {}).get("embedding"):
-                                    mem.metadata.embedding = node["metadata"]["embedding"]
-                                    self.logger.debug(f"[Unified Dedup] Fetched embedding from DB for {mem_id}")
-                        except Exception as e:
-                            self.logger.warning(f"[Unified Dedup] Failed to fetch embedding: {e}")
-
-                items_for_coarse.append(mem)
-
-        # Step 1.2: 使用MMR做粗排
+        # 使用统一的TwoStageMMRDeduplicator
         try:
-            from memos.reranker.mmr import MMRReranker
+            from memos.reranker.mmr import TwoStageMMRDeduplicator
 
-            # 创建MMRReranker进行粗排
-            mmr_coarse = MMRReranker(
+            # 创建deduplicator实例（参数写死）
+            deduplicator = TwoStageMMRDeduplicator(
+                reranker=self.reranker,
+                graph_store=self.graph_db,
+                embedder=self.searcher.embedder if self.searcher else None,  # 添加embedder
                 lambda_param=0.8,   # 写死参数
                 alpha=0.1,          # 写死参数
+                coarse_factor=3,    # 写死参数：粗排取3倍
             )
 
-            # 粗排：取top_k*3
-            coarse_results = mmr_coarse.rerank(
+            # 执行两阶段去重
+            deduped_items = deduplicator.deduplicate(
                 query=query,
-                graph_results=items_for_coarse,
-                top_k=coarse_top_k,
+                candidates=all_memories,
+                top_k=total_top_k,
             )
-
-            self.logger.info(f"[Unified Dedup] Stage 1 done: {len(coarse_results)} items after coarse ranking")
 
         except Exception as e:
-            self.logger.error(f"[Unified Dedup] Coarse ranking failed: {e}", exc_info=True)
-            # Fallback: 如果粗排失败，使用原始结果
-            coarse_results = [(mem, mem.get("metadata", {}).get("relativity", 0.5) if isinstance(mem, dict) else getattr(mem.metadata, "relativity", 0.5)) for mem in items_for_coarse[:coarse_top_k]]
-
-        # ===== Stage 2: 精排 - 使用http_bge reranker =====
-        self.logger.info(f"[Unified Dedup] Stage 2: Fine ranking with http_bge reranker (top_k={total_top_k})")
-
-        # 提取粗排后的items
-        coarse_items = [item for item, score in coarse_results]
-
-        try:
-            # 使用http_bge reranker精排
-            fine_results = self.reranker.rerank(
-                query=query,
-                graph_results=coarse_items,
-                top_k=total_top_k,  # 精排取最终的top_k
-            )
-
-            self.logger.info(f"[Unified Dedup] Stage 2 done: {len(fine_results)} items after fine ranking")
-
-        except Exception as e:
-            self.logger.error(f"[Unified Dedup] Fine ranking failed: {e}", exc_info=True)
-            # Fallback: 使用粗排结果
-            fine_results = coarse_results[:total_top_k]
+            self.logger.error(f"[Unified Dedup] TwoStageMMRDeduplicator failed: {e}", exc_info=True)
+            # Fallback: 直接用reranker
+            try:
+                deduped_items = self.reranker.rerank(
+                    query=query,
+                    graph_results=all_memories,
+                    top_k=total_top_k,
+                )
+            except Exception as e2:
+                self.logger.error(f"[Unified Dedup] Fallback reranker also failed: {e2}", exc_info=True)
+                # 最终fallback: 使用原始结果
+                deduped_items = [
+                    (mem, mem.get("metadata", {}).get("relativity", 0.5) if isinstance(mem, dict) else getattr(mem.metadata, "relativity", 0.5))
+                    for mem in all_memories[:total_top_k]
+                ]
 
         # Separate back to text and preference memories
         text_results = []
         pref_results = []
 
-        for item, score in fine_results:
+        for item, score in deduped_items:
             # Update score in metadata
             if isinstance(item, dict):
                 if "metadata" not in item:

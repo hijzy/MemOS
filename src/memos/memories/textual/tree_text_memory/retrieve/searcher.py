@@ -49,6 +49,7 @@ class Searcher:
         tokenizer: FastTokenizer | None = None,
         include_embedding: bool = False,
     ):
+        include_embedding = True  # jiang, 临时写死
         self.graph_store = graph_store
         self.embedder = embedder
         self.llm = dispatcher_llm
@@ -128,7 +129,7 @@ class Searcher:
         query: str | None = None,
     ):
         logger.info(f"[POST_RETRIEVE] dedup mode: {dedup}, query: {query[:50] if query else None}")
-        dedup = "no"  # jiang, 临时配置
+        # dedup = "mmr"  # jiang, 临时配置
         if dedup == "no":
             deduped = retrieved_results
         elif dedup == "mmr":
@@ -759,13 +760,9 @@ class Searcher:
         """
         Deduplicate results using MMR (Maximal Marginal Relevance).
 
-        Strategy:
-        1. Use http_bge reranker to get accurate relevance_score for each item
-        2. Use existing embeddings from database to calculate redundancy for MMR
-
-        This combines the best of both:
-        - Accurate relevance scores from reranker service
-        - Embedding-based redundancy calculation for diversity
+        使用统一的TwoStageMMRDeduplicator进行去重：
+        1. 粗排：embedding MMR（快速）
+        2. 精排：配置的reranker（准确）
 
         Args:
             results: List of (item, score) tuples from retrieval
@@ -788,8 +785,24 @@ class Searcher:
 
         logger.info(f"[MMR Dedup] Starting with {len(results)} results")
 
-        # Step 1: Call reranker to get accurate relevance scores
-        items_for_rerank = []
+        # 提取query_embedding（searcher已计算的cot_embedding）
+        query_embedding = None
+        if results and hasattr(results[0][0], "_query_embedding"):
+            cached_embedding = results[0][0]._query_embedding
+            if cached_embedding is not None:
+                # Handle both single embedding and list of embeddings
+                if isinstance(cached_embedding, list):
+                    if len(cached_embedding) > 0 and isinstance(cached_embedding[0], list):
+                        # List of embeddings, take the first one
+                        query_embedding = cached_embedding[0]
+                        logger.info(f"[MMR Dedup] Using cached query_embedding from retrieve stage (first from list)")
+                    else:
+                        # Single embedding
+                        query_embedding = cached_embedding
+                        logger.info(f"[MMR Dedup] Using cached query_embedding from retrieve stage")
+
+        # 准备candidates：提取items并保留原始score
+        items_for_dedup = []
         for item, score in results:
             # Create a copy to avoid mutating the original
             item_copy = TextualMemoryItem(
@@ -797,67 +810,37 @@ class Searcher:
                 memory=item.memory,
                 metadata=item.metadata.model_copy(deep=True),
             )
-            # Keep original score for now
+            # 保存原始score到metadata
             item_copy.metadata.relativity = score
-            items_for_rerank.append(item_copy)
+            items_for_dedup.append(item_copy)
 
+        # 使用统一的TwoStageMMRDeduplicator
         try:
-            # Use http_bge reranker to get accurate relevance scores
-            # Note: We pass a large top_k to get scores for all items
-            reranked_with_scores = self.reranker.rerank(
-                query=query,
-                graph_results=items_for_rerank,
-                top_k=len(items_for_rerank),  # Get scores for all items
+            from memos.reranker.mmr import TwoStageMMRDeduplicator
+
+            # 创建deduplicator实例（参数写死）
+            deduplicator = TwoStageMMRDeduplicator(
+                reranker=self.reranker,
+                graph_store=self.graph_store,
+                embedder=self.embedder,  # 用于fallback
+                lambda_param=0.8,   # 写死参数
+                alpha=0.1,          # 写死参数
+                coarse_factor=3,    # 写死参数：粗排取3倍
             )
 
-            logger.info(f"[MMR Dedup] Got {len(reranked_with_scores)} relevance scores from reranker")
-
-            # Update items with accurate relevance scores from reranker
-            for item, reranker_score in reranked_with_scores:
-                item.metadata.relativity = reranker_score
-
-            items_with_relevance = [item for item, score in reranked_with_scores]
-
-        except Exception as e:
-            logger.error(f"[MMR Dedup] Reranker failed to get relevance scores: {e}", exc_info=True)
-            logger.warning("[MMR Dedup] Falling back to simple deduplication")
-            return self._deduplicate_results(results)
-
-        # Step 2: Fetch embeddings from database if missing
-        for item in items_with_relevance:
-            if not item.metadata.embedding or len(item.metadata.embedding) == 0:
-                try:
-                    node = self.graph_store.get_node(item.id)
-                    if node and node.get("metadata", {}).get("embedding"):
-                        item.metadata.embedding = node["metadata"]["embedding"]
-                        logger.debug(f"[MMR Dedup] Fetched embedding for item {item.id}")
-                except Exception as e:
-                    logger.warning(f"[MMR Dedup] Failed to fetch embedding for item {item.id}: {e}")
-
-        # Step 3: Use MMR with reranker relevance scores and database embeddings
-        try:
-            from memos.reranker.mmr import MMRReranker
-
-            # Create MMRReranker with configured parameters
-            mmr_reranker = MMRReranker(
-                lambda_param=0.8,  # Balance between relevance and diversity
-                alpha=0.1,          # Tag penalty weight
-            )
-
-            # Call MMR reranker
-            # Note: We don't pass query_embedding, so MMR will use existing relativity scores
-            # from metadata (which we just updated with accurate reranker scores)
-            reranked_results = mmr_reranker.rerank(
+            # 执行两阶段去重，传入已计算的query_embedding
+            reranked_results = deduplicator.deduplicate(
                 query=query,
-                graph_results=items_with_relevance,
+                candidates=items_for_dedup,
                 top_k=top_k,
+                query_embedding=query_embedding,  # 传入searcher已计算的cot_embedding
             )
 
             logger.info(f"[MMR Dedup] After MMR: {len(reranked_results)} results")
             return reranked_results
 
         except Exception as e:
-            logger.error(f"[MMR Dedup] MMR reranking failed: {e}", exc_info=True)
+            logger.error(f"[MMR Dedup] TwoStageMMRDeduplicator failed: {e}", exc_info=True)
             logger.warning("[MMR Dedup] Falling back to simple deduplication")
             return self._deduplicate_results(results)
 
