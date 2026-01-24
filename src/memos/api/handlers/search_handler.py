@@ -62,7 +62,7 @@ class SearchHandler(BaseHandler):
             search_req.top_k = original_top_k * 5
         elif search_req.dedup == "mmr":
             # For MMR, also increase recall pool
-            search_req.top_k = original_top_k * 3
+            search_req.top_k = original_top_k * 10
 
         cube_view = self._build_cube_view(search_req)
 
@@ -236,9 +236,9 @@ class SearchHandler(BaseHandler):
         """
         Unified deduplication for both text and preference memories.
 
-        使用统一的TwoStageMMRDeduplicator进行去重：
-        1. 粗排：embedding MMR（快速）
-        2. 精排：配置的reranker（准确）
+        使用统一的TwoStageMMRDeduplicator进行去重:
+        1. 粗排: embedding MMR(快速)
+        2. 精排: 配置的reranker(准确)
 
         Args:
             results: Dictionary containing text_mem and pref_mem
@@ -281,14 +281,20 @@ class SearchHandler(BaseHandler):
         try:
             from memos.reranker.mmr import TwoStageMMRDeduplicator
 
-            # 创建deduplicator实例（参数写死）
+            query_embedding = None
+            try:
+                if self.searcher and getattr(self.searcher, "embedder", None):
+                    query_embedding = self.searcher.embedder.embed([query])[0]
+            except Exception:
+                query_embedding = None
+
             deduplicator = TwoStageMMRDeduplicator(
                 reranker=self.reranker,
                 graph_store=self.graph_db,
                 embedder=self.searcher.embedder if self.searcher else None,  # 添加embedder
                 lambda_param=0.8,   # 写死参数
                 alpha=0.1,          # 写死参数
-                coarse_factor=3,    # 写死参数：粗排取3倍
+                coarse_factor=5,    # 写死参数: 粗排取5倍
             )
 
             # 执行两阶段去重
@@ -296,11 +302,11 @@ class SearchHandler(BaseHandler):
                 query=query,
                 candidates=all_memories,
                 top_k=total_top_k,
+                query_embedding=query_embedding,
             )
 
         except Exception as e:
             self.logger.error(f"[Unified Dedup] TwoStageMMRDeduplicator failed: {e}", exc_info=True)
-            # Fallback: 直接用reranker
             try:
                 deduped_items = self.reranker.rerank(
                     query=query,
@@ -309,7 +315,6 @@ class SearchHandler(BaseHandler):
                 )
             except Exception as e2:
                 self.logger.error(f"[Unified Dedup] Fallback reranker also failed: {e2}", exc_info=True)
-                # 最终fallback: 使用原始结果
                 deduped_items = [
                     (mem, mem.get("metadata", {}).get("relativity", 0.5) if isinstance(mem, dict) else getattr(mem.metadata, "relativity", 0.5))
                     for mem in all_memories[:total_top_k]

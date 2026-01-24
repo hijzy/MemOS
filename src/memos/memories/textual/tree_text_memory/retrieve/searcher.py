@@ -760,9 +760,9 @@ class Searcher:
         """
         Deduplicate results using MMR (Maximal Marginal Relevance).
 
-        使用统一的TwoStageMMRDeduplicator进行去重：
-        1. 粗排：embedding MMR（快速）
-        2. 精排：配置的reranker（准确）
+        使用统一的TwoStageMMRDeduplicator进行去重:
+        1. 粗排: embedding MMR (快速)
+        2. 精排: 配置的reranker (准确)
 
         Args:
             results: List of (item, score) tuples from retrieval
@@ -785,23 +785,26 @@ class Searcher:
 
         logger.info(f"[MMR Dedup] Starting with {len(results)} results")
 
-        # 提取query_embedding（searcher已计算的cot_embedding）
         query_embedding = None
-        if results and hasattr(results[0][0], "_query_embedding"):
+        if (
+            results
+            and hasattr(results[0][0], "_query_embedding")
+            and results[0][0]._query_embedding is not None
+        ):
             cached_embedding = results[0][0]._query_embedding
-            if cached_embedding is not None:
-                # Handle both single embedding and list of embeddings
-                if isinstance(cached_embedding, list):
-                    if len(cached_embedding) > 0 and isinstance(cached_embedding[0], list):
-                        # List of embeddings, take the first one
-                        query_embedding = cached_embedding[0]
-                        logger.info(f"[MMR Dedup] Using cached query_embedding from retrieve stage (first from list)")
-                    else:
-                        # Single embedding
-                        query_embedding = cached_embedding
-                        logger.info(f"[MMR Dedup] Using cached query_embedding from retrieve stage")
+            if isinstance(cached_embedding, list):
+                if len(cached_embedding) > 0 and isinstance(cached_embedding[0], list):
+                    query_embedding = cached_embedding[0]
+                    logger.info(
+                        "[MMR Dedup] Using cached query_embedding from retrieve stage (first from list)"
+                    )
+                else:
+                    query_embedding = cached_embedding
+                    logger.info("[MMR Dedup] Using cached query_embedding from retrieve stage")
+            else:
+                query_embedding = cached_embedding
+                logger.info("[MMR Dedup] Using cached query_embedding from retrieve stage")
 
-        # 准备candidates：提取items并保留原始score
         items_for_dedup = []
         for item, score in results:
             # Create a copy to avoid mutating the original
@@ -818,17 +821,15 @@ class Searcher:
         try:
             from memos.reranker.mmr import TwoStageMMRDeduplicator
 
-            # 创建deduplicator实例（参数写死）
             deduplicator = TwoStageMMRDeduplicator(
                 reranker=self.reranker,
                 graph_store=self.graph_store,
                 embedder=self.embedder,  # 用于fallback
                 lambda_param=0.8,   # 写死参数
                 alpha=0.1,          # 写死参数
-                coarse_factor=3,    # 写死参数：粗排取3倍
+                coarse_factor=5,    # 写死参数: 粗排取5倍
             )
 
-            # 执行两阶段去重，传入已计算的query_embedding
             reranked_results = deduplicator.deduplicate(
                 query=query,
                 candidates=items_for_dedup,

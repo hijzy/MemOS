@@ -53,8 +53,8 @@ class MMRReranker(BaseReranker):
             level_weights: Optional weights for different memory levels
             level_field: Field name for memory level in metadata
         """
-        self.lambda_param = 1
-        self.alpha = 0
+        self.lambda_param = lambda_param
+        self.alpha = alpha
         self.tag_threshold = tag_threshold
         self.level_weights = level_weights or {"topic": 1.0, "concept": 1.0, "fact": 1.0}
         self.level_field = level_field
@@ -211,7 +211,11 @@ class MMRReranker(BaseReranker):
             if isinstance(item, dict):
                 score = item.get("metadata", {}).get("relativity")
             elif hasattr(item, "metadata"):
-                score = getattr(item.metadata, "relativity", None) or item.metadata.get("model_extra").get("relativity")
+                score = getattr(item.metadata, "relativity", None)
+                if score is None:
+                    model_extra = getattr(item.metadata, "model_extra", None)
+                    if isinstance(model_extra, dict):
+                        score = model_extra.get("relativity")
 
             if score is None:
                 # If any item lacks a relativity score, we can't use this optimization
@@ -332,21 +336,21 @@ class MMRReranker(BaseReranker):
 
 class TwoStageMMRDeduplicator:
     """
-    两阶段MMR去重器：统一的去重逻辑，避免代码重复。
+    两阶段MMR去重器: 统一的去重逻辑, 避免代码重复.
 
-    策略：
-    1. 粗排（Coarse Ranking）：使用embedding MMR快速过滤，取top_k * coarse_factor
+    策略:
+    1. 粗排(Coarse Ranking): 使用embedding MMR快速过滤, 取top_k * coarse_factor
        - 使用数据库embedding计算相似度
        - 本地快速计算
-    2. 精排（Fine Ranking）：使用配置的reranker精确排序，取top_k
+    2. 精排(Fine Ranking): 使用配置的reranker精确排序, 取top_k
        - 可以是http_bge或其他reranker
        - 提供准确的relevance分数
 
-    使用场景：
+    使用场景:
     - search_handler: 对text_mem和pref_mem统一去重
     - searcher: 对检索结果去重
 
-    参数全部可配置，适合不同场景。
+    参数全部可配置, 适合不同场景.
     """
 
     def __init__(
@@ -359,15 +363,15 @@ class TwoStageMMRDeduplicator:
         coarse_factor: int = 3,
     ):
         """
-        初始化两阶段MMR去重器。
+        初始化两阶段MMR去重器.
 
         Args:
-            reranker: 精排用的reranker（如HTTPBGEReranker）
-            graph_store: 图数据库实例，用于获取embedding
-            embedder: Embedder实例，用于计算query的embedding
-            lambda_param: MMR的lambda参数（相关性权重）
-            alpha: MMR的alpha参数（标签惩罚权重）
-            coarse_factor: 粗排倍数，粗排取top_k * coarse_factor个
+            reranker: 精排用的reranker(如HTTPBGEReranker)
+            graph_store: 图数据库实例, 用于获取embedding
+            embedder: Embedder实例, 用于计算query的embedding
+            lambda_param: MMR的lambda参数(相关性权重)
+            alpha: MMR的alpha参数(标签惩罚权重)
+            coarse_factor: 粗排倍数, 粗排取top_k * coarse_factor个
         """
         self.reranker = reranker
         self.graph_store = graph_store
@@ -388,20 +392,20 @@ class TwoStageMMRDeduplicator:
         query: str,
         candidates: list,  # TextualMemoryItem或dict
         top_k: int,
-        query_embedding: list[float] | None = None,  # 新增：可选的query_embedding
+        query_embedding: list[float] | None = None,  # 新增: 可选的query_embedding
     ) -> list[tuple]:
         """
-        两阶段MMR去重的主方法。
+        两阶段MMR去重的主方法.
 
         Args:
             query: 查询字符串
-            candidates: 候选items列表（可以是TextualMemoryItem或dict）
+            candidates: 候选items列表(可以是TextualMemoryItem或dict)
             top_k: 最终返回的数量
-            query_embedding: 可选的query embedding（如searcher中已计算的cot_embedding）
-                           如果提供，直接使用；否则用embedder现场计算
+            query_embedding: 可选的query embedding(如searcher中已计算的cot_embedding)
+                           如果提供, 直接使用; 否则用embedder现场计算
 
         Returns:
-            List of (item, score) tuples，按MMR分数排序
+            List of (item, score) tuples, 按MMR分数排序
         """
         if not candidates:
             return []
@@ -418,15 +422,15 @@ class TwoStageMMRDeduplicator:
 
         # Step 1.1: 获取或计算query的embedding
         if query_embedding is not None:
-            logger.info(f"[TwoStage MMR] Using provided query_embedding (e.g., cot_embedding from searcher)")
+            logger.info("[TwoStage MMR] Using provided query_embedding (e.g., cot_embedding from searcher)")
         else:
-            # Fallback: 如果没有提供query_embedding，用embedder计算
+            # 兼容: 如果没有提供query_embedding, 用embedder计算
             try:
                 query_embedding = self.embedder.embed([query])[0]
                 logger.info(f"[TwoStage MMR] Computed query embedding with embedder, dimension: {len(query_embedding)}")
             except Exception as e:
                 logger.error(f"[TwoStage MMR] Failed to compute query embedding: {e}", exc_info=True)
-                # Fallback: 如果无法计算query embedding，直接用reranker
+                # 兼容: 如果无法计算query embedding, 直接用reranker
                 logger.warning("[TwoStage MMR] Skipping coarse ranking, using reranker directly")
                 try:
                     return self.reranker.rerank(
@@ -438,10 +442,10 @@ class TwoStageMMRDeduplicator:
                     logger.error(f"[TwoStage MMR] Fallback reranker also failed: {e2}")
                     return [(item, self._get_relativity(item)) for item in candidates[:top_k]]
 
-        # Step 1.2: 确保所有candidates有embedding（从数据库获取）
+        # Step 1.2: 确保所有candidates有embedding(从数据库获取)
         self._ensure_embeddings(candidates)
 
-        # Step 1.3: MMR粗排（传入query_embedding，现场计算相似度）
+        # Step 1.3: MMR粗排(传入query_embedding, 现场计算相似度)
         try:
             coarse_results = self.mmr_reranker.rerank(
                 query=query,
@@ -452,7 +456,6 @@ class TwoStageMMRDeduplicator:
             logger.info(f"[TwoStage MMR] Stage 1 done: {len(coarse_results)} items after coarse ranking")
         except Exception as e:
             logger.error(f"[TwoStage MMR] Coarse ranking failed: {e}", exc_info=True)
-            # Fallback: 使用原始结果
             coarse_results = [(item, self._get_relativity(item)) for item in candidates[:coarse_top_k]]
 
         # ===== Stage 2: 精排 - 使用reranker =====
@@ -460,18 +463,24 @@ class TwoStageMMRDeduplicator:
 
         # 提取粗排后的items
         coarse_items = [item for item, score in coarse_results]
+        reranker_items, id_to_original = self._prepare_items_for_reranker(coarse_items)
 
         try:
             # 使用配置的reranker精排
-            fine_results = self.reranker.rerank(
+            fine_results_raw = self.reranker.rerank(
                 query=query,
-                graph_results=coarse_items,
+                graph_results=reranker_items,
                 top_k=top_k,
             )
+            fine_results = []
+            for item, score in fine_results_raw:
+                item_id = getattr(item, "id", None)
+                original_item = id_to_original.get(item_id, item)
+                fine_results.append((original_item, score))
+
             logger.info(f"[TwoStage MMR] Stage 2 done: {len(fine_results)} items after fine ranking")
         except Exception as e:
             logger.error(f"[TwoStage MMR] Fine ranking failed: {e}", exc_info=True)
-            # Fallback: 使用粗排结果
             fine_results = coarse_results[:top_k]
 
         logger.info(
@@ -481,26 +490,95 @@ class TwoStageMMRDeduplicator:
 
         return fine_results
 
-    def _ensure_embeddings(self, items: list) -> None:
-        """
-        确保所有items都有embedding，如果缺失则从数据库获取。
+    def _prepare_items_for_reranker(self, items: list[Any]) -> tuple[list[Any], dict[str, Any]]:
+        reranker_items: list[Any] = []
+        id_to_original: dict[str, Any] = {}
 
-        Args:
-            items: 候选items列表（会被就地修改）
-        """
         for item in items:
             if isinstance(item, dict):
-                # 处理dict格式
-                embedding = item.get("metadata", {}).get("embedding")
-                if not embedding or len(embedding) == 0:
-                    self._fetch_embedding_dict(item)
+                item_id = item.get("id")
+                if isinstance(item_id, str) and item_id:
+                    id_to_original[item_id] = item
+                converted = self._dict_to_textual_item(item)
+                if converted is not None:
+                    reranker_items.append(converted)
             else:
-                # 处理object格式 (TextualMemoryItem)
-                if not hasattr(item, "metadata") or not hasattr(item.metadata, "embedding") or not item.metadata.embedding or len(item.metadata.embedding) == 0:
-                    self._fetch_embedding_object(item)
+                item_id = getattr(item, "id", None)
+                if isinstance(item_id, str) and item_id:
+                    id_to_original[item_id] = item
+                reranker_items.append(item)
+
+        return reranker_items, id_to_original
+
+    def _dict_to_textual_item(self, item: dict[str, Any]) -> Any | None:
+        try:
+            from memos.memories.textual.item import TextualMemoryItem
+
+            item_id = item.get("id")
+            memory = item.get("memory", "")
+            metadata = item.get("metadata", {})
+            if not isinstance(item_id, str) or not item_id:
+                return None
+            if not isinstance(memory, str):
+                return None
+            if not isinstance(metadata, dict):
+                metadata = {}
+
+            return TextualMemoryItem.from_dict({"id": item_id, "memory": memory, "metadata": metadata})
+        except Exception:
+            return None
+
+    def _ensure_embeddings(self, items: list) -> None:
+        """
+        确保所有items都有embedding, 如果缺失则从数据库获取.
+
+        Args:
+            items: 候选items列表(会被就地修改)
+        """
+        missing_ids: list[str] = []
+        for item in items:
+            if isinstance(item, dict):
+                embedding = item.get("metadata", {}).get("embedding")
+                if not embedding:
+                    item_id = item.get("id")
+                    if isinstance(item_id, str) and item_id:
+                        missing_ids.append(item_id)
+            else:
+                embedding = None
+                if hasattr(item, "metadata"):
+                    embedding = getattr(item.metadata, "embedding", None)
+                if not embedding:
+                    item_id = getattr(item, "id", None)
+                    if isinstance(item_id, str) and item_id:
+                        missing_ids.append(item_id)
+
+        if not missing_ids:
+            return
+
+        embedding_map = self._batch_fetch_embeddings(missing_ids)
+        if not embedding_map:
+            return
+
+        for item in items:
+            if isinstance(item, dict):
+                item_id = item.get("id")
+                emb = embedding_map.get(item_id)
+                if emb:
+                    if "metadata" not in item or not isinstance(item["metadata"], dict):
+                        item["metadata"] = {}
+                    item["metadata"]["embedding"] = emb
+            else:
+                item_id = getattr(item, "id", None)
+                emb = embedding_map.get(item_id)
+                if emb:
+                    if not hasattr(item, "metadata"):
+                        from types import SimpleNamespace
+
+                        item.metadata = SimpleNamespace()
+                    item.metadata.embedding = emb
 
     def _fetch_embedding_dict(self, item: dict) -> None:
-        """从数据库获取embedding（dict格式）"""
+        """从数据库获取embedding(dict格式)"""
         try:
             item_id = item.get("id")
             if item_id and self.graph_store:
@@ -514,7 +592,7 @@ class TwoStageMMRDeduplicator:
             logger.warning(f"[TwoStage MMR] Failed to fetch embedding: {e}")
 
     def _fetch_embedding_object(self, item: Any) -> None:
-        """从数据库获取embedding（object格式）"""
+        """从数据库获取embedding(object格式)"""
         try:
             item_id = getattr(item, "id", None)
             if item_id and self.graph_store:
@@ -528,11 +606,42 @@ class TwoStageMMRDeduplicator:
         except Exception as e:
             logger.warning(f"[TwoStage MMR] Failed to fetch embedding: {e}")
 
+    def _batch_fetch_embeddings(self, ids: list[str]) -> dict[str, list[float]]:
+        if not self.graph_store or not ids:
+            return {}
+
+        nodes: list[dict[str, Any]] = []
+        try:
+            if hasattr(self.graph_store, "get_nodes"):
+                nodes = self.graph_store.get_nodes(list(dict.fromkeys(ids)), include_embedding=True)
+            else:
+                nodes = []
+        except Exception as e:
+            logger.warning(f"[TwoStage MMR] Failed to batch fetch embeddings: {e}")
+            nodes = []
+
+        if not nodes:
+            for one_id in ids:
+                try:
+                    node = self.graph_store.get_node(one_id, include_embedding=True)
+                    if node:
+                        nodes.append(node)
+                except Exception:
+                    continue
+
+        embedding_map: dict[str, list[float]] = {}
+        for node in nodes:
+            node_id = node.get("id")
+            emb = node.get("metadata", {}).get("embedding")
+            if isinstance(node_id, str) and isinstance(emb, list) and emb:
+                embedding_map[node_id] = emb
+
+        return embedding_map
+
     def _get_relativity(self, item: Any) -> float:
-        """获取item的relativity分数，用于fallback"""
+        """获取item的relativity分数, 用于fallback"""
         if isinstance(item, dict):
             return item.get("metadata", {}).get("relativity", 0.5)
         elif hasattr(item, "metadata"):
             return getattr(item.metadata, "relativity", 0.5)
         return 0.5
-
