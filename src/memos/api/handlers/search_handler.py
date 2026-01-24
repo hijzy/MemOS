@@ -62,7 +62,7 @@ class SearchHandler(BaseHandler):
             search_req.top_k = original_top_k * 5
         elif search_req.dedup == "mmr":
             # For MMR, also increase recall pool
-            search_req.top_k = original_top_k * 10
+            search_req.top_k = original_top_k * 5
 
         cube_view = self._build_cube_view(search_req)
 
