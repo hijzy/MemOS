@@ -292,8 +292,8 @@ class SearchHandler(BaseHandler):
                 reranker=self.reranker,
                 graph_store=self.graph_db,
                 embedder=self.searcher.embedder if self.searcher else None,  # 添加embedder
-                lambda_param=0.8,   # 写死参数
-                alpha=0.1,          # 写死参数
+                lambda_param=1,   # 写死参数
+                alpha=0,          # 写死参数
                 coarse_factor=5,    # 写死参数: 粗排取5倍
             )
 

@@ -375,13 +375,15 @@ class APIConfig:
     @staticmethod
     def get_reranker_config() -> dict[str, Any]:
         """Get embedder configuration."""
-        embedder_backend = os.getenv("MOS_RERANKER_BACKEND", "http_bge")
+        # embedder_backend = os.getenv("MOS_RERANKER_BACKEND", "http_bge")
+        embedder_backend = "http_bge"
 
         if embedder_backend in ["http_bge", "http_bge_strategy"]:
             return {
                 "backend": embedder_backend,
                 "config": {
-                    "url": os.getenv("MOS_RERANKER_URL", "localhost:8000/v1/rerank"),
+                    # "url": os.getenv("MOS_RERANKER_URL", "localhost:8000/v1/rerank"),
+                    "url": "http://106.75.235.231:8082/v1/rerank",
                     "model": os.getenv("MOS_RERANKER_MODEL", "bge-reranker-v2-m3"),
                     "timeout": 10,
                     "headers_extra": json.loads(os.getenv("MOS_RERANKER_HEADERS_EXTRA", "{}")),
